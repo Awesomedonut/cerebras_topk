@@ -1,0 +1,152 @@
+// =============================================================================
+// layout.csl — chain-reduction Top-K k-NN
+// =============================================================================
+//
+// TOPOLOGY (P×P PE grid):
+//   Phase 1 (EW chain, all rows in parallel):
+//     PE(P-1,y) → PE(P-2,y) → ... → PE(0,y)
+//     Each step: receiver merges its K with sender's K, keeps top K, forwards.
+//   Phase 2 (NS chain, col 0 only):
+//     PE(0,P-1) → PE(0,P-2) → ... → PE(0,0)
+//     Final K-best end up at PE(0,0).
+//
+// COLORS (4 total — ping-pong per direction):
+//   ew_color_a: edge {right-Px is odd} — for P=4 carries edges 3→2 and 1→0
+//   ew_color_b: edge {right-Px is even} — for P=4 carries edge 2→1
+//   ns_color_a: edge {lower-Py is odd} — for P=4 col 0: edges 3→2 and 1→0
+//   ns_color_b: edge {lower-Py is even} — for P=4 col 0: edge 2→1
+//
+// PER-PE COLOR ROLES:
+//   On color_a:
+//     even-Px PE → receiver from EAST (rx=EAST tx=RAMP)
+//     odd-Px  PE → sender to WEST    (rx=RAMP tx=WEST)
+//   On color_b:
+//     odd-Px  PE → receiver from EAST (rx=EAST tx=RAMP)
+//     even-Px PE → sender to WEST    (rx=RAMP tx=WEST)
+//   Endpoints (Px=0 or Px=P-1) only configure the color they actually use.
+//   Same pattern for NS but only on col 0; non-col-0 PEs ignore NS colors.
+// =============================================================================
+
+param P : u16;
+param d_dim : u16;
+param rows_per_pe : u16;
+param K : u16;
+
+// 4 colors for chain reduction
+const ew_color_a : color = @get_color(0);
+const ew_color_b : color = @get_color(1);
+const ns_color_a : color = @get_color(4);
+const ns_color_b : color = @get_color(5);
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+  .width = P,
+  .height = P,
+});
+
+layout {
+  @set_rectangle(P, P);
+
+  var Px : u16 = 0;
+  while (Px < P) : (Px += 1) {
+    const memcpy_params = memcpy.get_params(Px);
+    var Py : u16 = 0;
+    while (Py < P) : (Py += 1) {
+      // Per-PE EW color assignment.
+      // Sender on color_a iff Px is odd; sender on color_b iff Px is even.
+      // Receiver on color_a iff (Px+1) is odd, i.e., Px is even.
+      // Receiver on color_b iff (Px+1) is even, i.e., Px is odd.
+      const ew_send_color = if (Px % 2 == 1) ew_color_a else ew_color_b;
+      const ew_recv_color = if ((Px + 1) % 2 == 1) ew_color_a else ew_color_b;
+
+      // Same logic for NS.
+      const ns_send_color = if (Py % 2 == 1) ns_color_a else ns_color_b;
+      const ns_recv_color = if ((Py + 1) % 2 == 1) ns_color_a else ns_color_b;
+
+      // Role flags (compile-time constants per PE)
+      const is_ew_sender : bool = Px > 0;          // can send west
+      const is_ew_recver : bool = Px < P - 1;      // can receive from east
+      const is_col_0     : bool = Px == 0;
+      const is_ns_sender : bool = is_col_0 and (Py > 0);
+      const is_ns_recver : bool = is_col_0 and (Py < P - 1);
+
+      @set_tile_code(Px, Py, "pe.csl", .{
+        .memcpy_params = memcpy_params,
+        .P = P,
+        .d_dim = d_dim,
+        .rows_per_pe = rows_per_pe,
+        .K = K,
+        .ew_send_color = ew_send_color,
+        .ew_recv_color = ew_recv_color,
+        .ns_send_color = ns_send_color,
+        .ns_recv_color = ns_recv_color,
+        .is_ew_sender = is_ew_sender,
+        .is_ew_recver = is_ew_recver,
+        .is_col_0 = is_col_0,
+        .is_ns_sender = is_ns_sender,
+        .is_ns_recver = is_ns_recver,
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // ROUTING TABLES
+  // ---------------------------------------------------------------------------
+  const RX_RAMP_TX_WEST  = .{ .rx = .{RAMP},  .tx = .{WEST}  };
+  const RX_EAST_TX_RAMP  = .{ .rx = .{EAST},  .tx = .{RAMP}  };
+  const RX_RAMP_TX_NORTH = .{ .rx = .{RAMP},  .tx = .{NORTH} };
+  const RX_SOUTH_TX_RAMP = .{ .rx = .{SOUTH}, .tx = .{RAMP}  };
+
+  Px = 0;
+  while (Px < P) : (Px += 1) {
+    var Py : u16 = 0;
+    while (Py < P) : (Py += 1) {
+
+      // ----- EW color_a -----
+      // Senders (odd Px, but only if there's someone west of them, i.e., Px > 0)
+      if (Px > 0 and Px % 2 == 1) {
+        @set_color_config(Px, Py, ew_color_a, .{ .routes = RX_RAMP_TX_WEST });
+      }
+      // Receivers (even Px, but only if there's someone east of them, i.e., Px < P-1)
+      else if (Px < P - 1 and Px % 2 == 0) {
+        @set_color_config(Px, Py, ew_color_a, .{ .routes = RX_EAST_TX_RAMP });
+      }
+
+      // ----- EW color_b -----
+      // Senders (even Px, but only middle: Px > 0)
+      if (Px > 0 and Px % 2 == 0) {
+        @set_color_config(Px, Py, ew_color_b, .{ .routes = RX_RAMP_TX_WEST });
+      }
+      // Receivers (odd Px, only if not rightmost: Px < P-1)
+      else if (Px < P - 1 and Px % 2 == 1) {
+        @set_color_config(Px, Py, ew_color_b, .{ .routes = RX_EAST_TX_RAMP });
+      }
+
+      // ----- NS colors (col 0 only) -----
+      if (Px == 0) {
+        // ns_color_a senders: odd Py (and Py > 0 implicitly when odd > 0)
+        if (Py > 0 and Py % 2 == 1) {
+          @set_color_config(Px, Py, ns_color_a, .{ .routes = RX_RAMP_TX_NORTH });
+        } else if (Py < P - 1 and Py % 2 == 0) {
+          @set_color_config(Px, Py, ns_color_a, .{ .routes = RX_SOUTH_TX_RAMP });
+        }
+
+        // ns_color_b senders: even Py (and Py > 0)
+        if (Py > 0 and Py % 2 == 0) {
+          @set_color_config(Px, Py, ns_color_b, .{ .routes = RX_RAMP_TX_NORTH });
+        } else if (Py < P - 1 and Py % 2 == 1) {
+          @set_color_config(Px, Py, ns_color_b, .{ .routes = RX_SOUTH_TX_RAMP });
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // HOST-VISIBLE EXPORTS
+  // ---------------------------------------------------------------------------
+  @export_name("D_shard",     [*]f32, true);
+  @export_name("q",           [*]f32, true);
+  @export_name("final_dists", [*]f32, false);
+  @export_name("final_idxs",  [*]u32, false);
+  @export_name("perf_log",    [*]u32, false);
+  @export_name("main",        fn()void);
+}

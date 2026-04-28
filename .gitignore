@@ -1,0 +1,7 @@
+out*/
+simfab_traces/
+wio_flows_tmpdir.*/
+perf_*.json
+__pycache__/
+*.pyc
+.DS_Store

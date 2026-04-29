@@ -107,6 +107,10 @@ var merge_idxs  : [K]u32;
 
 var diff_buf : [d_dim]f32;
 
+// Column-wise distance buffers (v8-colwise)
+var dist_buf : [rows_per_pe]f32;  // accumulated squared distances per row
+var tmp_buf  : [rows_per_pe]f32;  // scratch for per-column diff²
+
 const SENTINEL_DIST : f32 = 3.4e+38;
 const SENTINEL_IDX  : u32 = 0xFFFFFFFF;
 
@@ -116,6 +120,10 @@ const SENTINEL_IDX  : u32 = 0xFFFFFFFF;
 // -----------------------------------------------------------------------------
 const q_dsd    = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{d_dim} -> q[i] });
 const diff_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{d_dim} -> diff_buf[i] });
+
+// Column-wise DSDs: process all rows_per_pe rows at once per column
+const dist_buf_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{rows_per_pe} -> dist_buf[i] });
+const tmp_buf_dsd  = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{rows_per_pe} -> tmp_buf[i] });
 
 const send_buf_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * K} -> send_buf[i] });
 const recv_buf_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * K} -> recv_buf[i] });
@@ -262,6 +270,7 @@ fn heap_sort_asc() void {
 // d_dim the per-element call overhead exceeds the savings.
 // Measured 2026-04-28: d_dim=32 wins 1.25-1.76x; d_dim=16 loses 3-12%.
 const USE_MAP_DISTANCE : bool = d_dim >= 32;
+const USE_COLWISE_DIST : bool = true;  // v8: column-wise strided DSD distance
 
 fn reduce_diff_sqr(d_val: f32, q_val: f32, sum: *f32) f32 {
   const diff : f32 = d_val - q_val;
@@ -357,46 +366,83 @@ task compute() void {
   const pe_linear : u32 = @as(u32, py) * @as(u32, P) + @as(u32, px);
   const global_offset : u32 = pe_linear * @as(u32, rows_per_pe);
 
-  // SORT_ALL needs no init (we overwrite all K slots); other paths need sentinels.
-  if (!SORT_ALL) {
-    init_topk();
-  }
+  if (USE_COLWISE_DIST) {
+    // ===== v8 COLUMN-WISE DISTANCE =====
+    // Process one column at a time across ALL rows (strided DSD).
+    // d_dim iterations of extent=rows_per_pe ops, instead of
+    // rows_per_pe iterations of extent=d_dim ops.
+    //
+    // dist_buf[row] = sum_j (D_shard[row*d_dim + j] - q[j])^2
 
-  var row_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{d_dim} -> D_shard[i] });
-  var row : u16 = 0;
-  while (row < rows_per_pe) : (row += 1) {
-    // Inline distance compute to remove the two-level fn-call overhead from
-    // compute_row_dist → compute_row_dist_{map,dsd}. Comptime branch on
-    // USE_MAP_DISTANCE is dead-code-eliminated to a single path per case.
-    var dist : f32 = 0.0;
-    if (USE_MAP_DISTANCE) {
-      @map(reduce_diff_sqr, row_dsd, q_dsd, &dist, &dist);
-    } else {
-      @fsubs(diff_dsd, row_dsd, q_dsd);
-      @fmuls(diff_dsd, diff_dsd, diff_dsd);
-      var k : u16 = 0;
-      while (k < d_dim) : (k += 1) {
-        dist = dist + diff_buf[k];
-      }
+    // Zero out dist_buf
+    var zr : u16 = 0;
+    while (zr < rows_per_pe) : (zr += 1) { dist_buf[zr] = 0.0; }
+
+    // Strided column DSD: D_shard[0], D_shard[d_dim], D_shard[2*d_dim], ...
+    var col_dsd = @get_dsd(mem1d_dsd, .{
+      .tensor_access = |i|{rows_per_pe} -> D_shard[i * @as(i16, d_dim)]
+    });
+
+    var j : u16 = 0;
+    while (j < d_dim) : (j += 1) {
+      // tmp[row] = D_shard[row*d_dim + j] - q[j]  (scalar broadcast)
+      @fsubs(tmp_buf_dsd, col_dsd, q[j]);
+      // tmp[row] = tmp[row]^2
+      @fmuls(tmp_buf_dsd, tmp_buf_dsd, tmp_buf_dsd);
+      // dist[row] += tmp[row]
+      @fadds(dist_buf_dsd, dist_buf_dsd, tmp_buf_dsd);
+      // Advance to next column
+      col_dsd = @increment_dsd_offset(col_dsd, 1, f32);
     }
-    const global_idx : u32 = global_offset + @as(u32, row);
+
+    // Now dist_buf[row] has squared L2 for each row. Feed into top-K.
     if (SORT_ALL) {
-      local_dists[row] = dist;
-      local_idxs[row]  = global_idx;
+      // K == rows_per_pe: just copy all distances, then sort
+      var row : u16 = 0;
+      while (row < rows_per_pe) : (row += 1) {
+        local_dists[row] = dist_buf[row];
+        local_idxs[row]  = global_offset + @as(u32, row);
+      }
+      heapify();
+      heap_sort_asc();
     } else {
-      insert_topk(dist, global_idx);
+      // Streaming insert from precomputed distances
+      if (!SORT_ALL) { init_topk(); }
+      var row : u16 = 0;
+      while (row < rows_per_pe) : (row += 1) {
+        insert_topk(dist_buf[row], global_offset + @as(u32, row));
+      }
+      if (USE_HEAP) { heap_sort_asc(); }
     }
-    row_dsd = @increment_dsd_offset(row_dsd, @as(i16, d_dim), f32);
-  }
-  // Sort to ascending (chain-merge needs sorted input):
-  //   SORT_ALL: heapify (Floyd O(K)) then heap_sort_asc
-  //   USE_HEAP (incremental heap): just heap_sort_asc (already a heap)
-  //   else (insertion sort): already sorted, nothing to do
-  if (SORT_ALL) {
-    heapify();
-    heap_sort_asc();
-  } else if (USE_HEAP) {
-    heap_sort_asc();
+  } else {
+    // ===== ORIGINAL ROW-WISE DISTANCE =====
+    if (!SORT_ALL) { init_topk(); }
+
+    var row_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{d_dim} -> D_shard[i] });
+    var row : u16 = 0;
+    while (row < rows_per_pe) : (row += 1) {
+      var dist : f32 = 0.0;
+      if (USE_MAP_DISTANCE) {
+        @map(reduce_diff_sqr, row_dsd, q_dsd, &dist, &dist);
+      } else {
+        @fsubs(diff_dsd, row_dsd, q_dsd);
+        @fmuls(diff_dsd, diff_dsd, diff_dsd);
+        var k : u16 = 0;
+        while (k < d_dim) : (k += 1) {
+          dist = dist + diff_buf[k];
+        }
+      }
+      const global_idx : u32 = global_offset + @as(u32, row);
+      if (SORT_ALL) {
+        local_dists[row] = dist;
+        local_idxs[row]  = global_idx;
+      } else {
+        insert_topk(dist, global_idx);
+      }
+      row_dsd = @increment_dsd_offset(row_dsd, @as(i16, d_dim), f32);
+    }
+    if (SORT_ALL) { heapify(); heap_sort_asc(); }
+    else if (USE_HEAP) { heap_sort_asc(); }
   }
 
   pack_local_topk();

@@ -1,258 +1,257 @@
 #!/usr/bin/env cs_python
+"""Host driver for the Top-K k-NN kernel.
+
+Usage:
+  cs_python run.py --name <build_dir> --case <case_name>
+
+Prints "PASS: <case_name>" on success.
 """
-================================================================================
-run.py — Host driver for the Top-K k-NN kernel
-================================================================================
 
-WHAT THIS FILE DOES (runs on Linux CPU, NOT on the wafer):
-   1. Generates the test case's D + q (same generator as the grader)
-   2. Sets up SdkRuntime — Cerebras' Python library that talks to the wafer
-   3. Sends D shards to all 16 PEs (memcpy_h2d)
-   4. Sends q replicated to all 16 PEs
-   5. Calls runner.launch("main") — runs the kernel on the wafer
-   6. Reads back final K dists + idxs from PE(0,0) (memcpy_d2h)
-   7. Compares against NumPy oracle from reference.py
-   8. Prints "PASS: <case>" if correct (the grader greps for this string)
-
-NOTE: this script must run with `cs_python` (not regular `python3`).
-`cs_python` is the SDK-provided Python that has the cerebras runtime library.
-
-Docs: https://sdk.cerebras.net/api-docs/sdkruntime-api
-================================================================================
-"""
 import argparse
 import json
 import sys
+import time
 import numpy as np
+from pathlib import Path
 
-# SdkRuntime: the bridge between Python (host) and the wafer (device).
-# Provided by the Cerebras SDK; only available inside cs_python.
-from cerebras.sdk.runtime.sdkruntimepybind import (
-    SdkRuntime, MemcpyDataType, MemcpyOrder
-)
+# Search for reference.py: same dir, parent dir, or challenge root
+_here = Path(__file__).resolve().parent
+for _candidate in [_here, _here.parent, _here.parent / "cerebras-kernel-challenge"]:
+    if (_candidate / "reference.py").exists():
+        sys.path.insert(0, str(_candidate))
+        break
 
-# Import the same case generators the official grader uses.
-# This guarantees we test against the exact inputs the grader will use.
-sys.path.insert(0, '.')
-from reference import (
-    topk_reference,
-    make_baseline, make_k_eq_1, make_k_large,
-    make_uneven, make_all_equal, make_duplicates,
-)
+from reference import topk_reference, ALL_CASES  # noqa: E402
 
-# Map case names → generator functions (called via CASE_MAKERS[args.case]())
-CASE_MAKERS = {
-    'baseline':   make_baseline,
-    'k_eq_1':     make_k_eq_1,
-    'k_large':    make_k_large,
-    'uneven':     make_uneven,
-    'all_equal':  make_all_equal,
-    'duplicates': make_duplicates,
+from cerebras.sdk.runtime.sdkruntimepybind import SdkRuntime      # noqa: E402
+from cerebras.sdk.runtime.sdkruntimepybind import MemcpyDataType   # noqa: E402
+from cerebras.sdk.runtime.sdkruntimepybind import MemcpyOrder      # noqa: E402
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+parser = argparse.ArgumentParser()
+parser.add_argument("--name", required=True, help="cslc output directory")
+parser.add_argument("--case", required=True, help="test case name")
+parser.add_argument("--cmaddr", default=None, help="IP:port for CS system")
+args = parser.parse_args()
+
+# ---------------------------------------------------------------------------
+# Load compile params from out.json
+# ---------------------------------------------------------------------------
+print(f"[1/7] Loading compile params from {args.name}/out.json ...")
+with open(f"{args.name}/out.json", encoding="utf-8") as f:
+    compile_data = json.load(f)
+params = compile_data["params"]
+P = int(params["P"])
+d_dim = int(params["d_dim"])
+rows_per_pe = int(params["rows_per_pe"])
+K = int(params["K"])
+
+print(f"       Case: {args.case}")
+print(f"       P={P}  d_dim={d_dim}  rows_per_pe={rows_per_pe}  K={K}")
+print(f"       PE grid: {P}x{P} = {P*P} PEs")
+print(f"       Total PE slots: {P*P*rows_per_pe} rows")
+print(f"       Sort path: {'SHELL SORT (K >= rows_per_pe)' if K >= rows_per_pe else 'BINARY SEARCH + INSERTION SORT'}")
+
+# ---------------------------------------------------------------------------
+# Generate test case (matches reference.py exactly)
+# ---------------------------------------------------------------------------
+print(f"[2/7] Generating test case '{args.case}' ...")
+CASE_MAP = {
+    "baseline":   0,
+    "k_eq_1":     1,
+    "k_large":    2,
+    "uneven":     3,
+    "all_equal":  4,
+    "duplicates": 5,
 }
+assert args.case in CASE_MAP, f"Unknown case: {args.case}"
+case = ALL_CASES[CASE_MAP[args.case]]()
+D = case["D"]
+q = case["q"]
+N = D.shape[0]
 
+print(f"       D shape: {D.shape}  (N={N}, d={d_dim})")
+print(f"       q shape: {q.shape}")
+print(f"       q[:5] = {q[:5].tolist()}")
 
-def shard_D_for_pes(D: np.ndarray, P: int, rows_per_pe: int, d_dim: int):
-    """Reshape D into the layout the wafer expects.
+# ---------------------------------------------------------------------------
+# Pad D to fill P*P*rows_per_pe rows. Padded rows get huge values so their
+# squared-L2 distance is effectively +inf and they never enter top-K.
+# ---------------------------------------------------------------------------
+total_rows = P * P * rows_per_pe
+padded_count = total_rows - N
+D_padded = np.full((total_rows, d_dim), 1.0e20, dtype=np.float32)
+D_padded[:N] = D
 
-    The kernel expects PE(col, row) to own rows D_padded[(row*P + col)*rows_per_pe : ...].
-    For memcpy_h2d with ROW_MAJOR ordering on a P×P grid, the array must be
-    indexed as data[height=P][width=P][rows_per_pe * d_dim].
+print(f"       Padded: {N} real rows + {padded_count} padding rows = {total_rows} total")
+if padded_count > 0:
+    print(f"       Padding rows filled with 1e20 (squared dist → +inf)")
 
-    Padding: if N (D.shape[0]) < P*P*rows_per_pe (e.g. uneven case with N=1009),
-    pad with 1e6 — those padded rows produce huge distances that never enter
-    any top-K, so we don't need device-side handling.
-    """
-    N_total = P * P * rows_per_pe
-    N_actual = D.shape[0]
-    assert N_actual <= N_total, f"D has {N_actual} rows, grid holds {N_total}"
+# Show PE shard assignment
+print(f"       PE shard assignment (ROW_MAJOR: PE linear idx = py*P + px):")
+for py in range(min(P, 2)):
+    for px in range(min(P, 2)):
+        start = (py * P + px) * rows_per_pe
+        end = start + rows_per_pe
+        valid = min(rows_per_pe, max(0, N - start))
+        print(f"         PE({px},{py}): rows [{start}..{end-1}], {valid}/{rows_per_pe} valid")
+    if P > 2:
+        print(f"         ... ({P-2} more columns)")
+if P > 2:
+    print(f"       ... ({P-2} more rows)")
 
-    if N_actual < N_total:
-        pad = np.full((N_total - N_actual, d_dim), 1e6, dtype=np.float32)
-        D_padded = np.vstack([D, pad])
-    else:
-        D_padded = D
+# ---------------------------------------------------------------------------
+# Set up runner
+# ---------------------------------------------------------------------------
+print(f"[3/7] Creating SdkRuntime from {args.name} ...")
+runner = SdkRuntime(args.name, cmaddr=args.cmaddr)
 
-    # Reshape into the (P, P, rows_per_pe * d_dim) layout that ROW_MAJOR memcpy
-    # will deliver to PE(col, row) correctly.
-    out = np.zeros((P, P, rows_per_pe * d_dim), dtype=np.float32)
-    for row in range(P):
-        for col in range(P):
-            pe_linear = row * P + col
-            shard = D_padded[pe_linear * rows_per_pe : (pe_linear + 1) * rows_per_pe]
-            out[row, col, :] = shard.ravel()
-    return out.ravel()
+D_sym    = runner.get_id("D_shard")
+q_sym    = runner.get_id("q")
+idx_sym  = runner.get_id("final_idxs")
+dist_sym = runner.get_id("final_dists")
 
+runner.load()
+runner.run()
+print(f"       Simulator loaded and running")
 
-def main():
-    # -------------------------------------------------------------------------
-    # CLI: --name = compile output dir (e.g. out_baseline), --case = test name
-    # -------------------------------------------------------------------------
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--name", required=True, help="compile output dir")
-    parser.add_argument("--case", required=True, choices=list(CASE_MAKERS))
-    parser.add_argument("--cmaddr", default=None, help="real wafer IP:port (None=simulator)")
-    args = parser.parse_args()
+# ---------------------------------------------------------------------------
+# H2D: copy D shards to all PEs (ROW_MAJOR: PE linear idx = py*P + px)
+# ---------------------------------------------------------------------------
+print(f"[4/7] H2D: copying D shards to {P*P} PEs ({rows_per_pe * d_dim} floats/PE) ...")
+t0 = time.time()
+runner.memcpy_h2d(
+    D_sym,
+    D_padded.flatten(),
+    0, 0, P, P,
+    rows_per_pe * d_dim,
+    streaming=False,
+    order=MemcpyOrder.ROW_MAJOR,
+    data_type=MemcpyDataType.MEMCPY_32BIT,
+    nonblock=False,
+)
+t1 = time.time()
+print(f"       D copied: {D_padded.nbytes:,} bytes in {t1-t0:.2f}s")
 
-    # -------------------------------------------------------------------------
-    # 1. Generate the test inputs (same generator as grader)
-    # -------------------------------------------------------------------------
-    case = CASE_MAKERS[args.case]()
-    D, q, K, P = case['D'], case['q'], case['K'], case['P']
-    d_dim = D.shape[1]
+# H2D: broadcast q to every PE
+print(f"       H2D: copying q to {P*P} PEs ({d_dim} floats/PE) ...")
+runner.memcpy_h2d(
+    q_sym,
+    np.tile(q, P * P),
+    0, 0, P, P,
+    d_dim,
+    streaming=False,
+    order=MemcpyOrder.ROW_MAJOR,
+    data_type=MemcpyDataType.MEMCPY_32BIT,
+    nonblock=False,
+)
+print(f"       q copied: {q.nbytes * P * P:,} bytes")
 
-    # Read compile-time params (rows_per_pe) from the cslc-emitted out.json
-    with open(f"{args.name}/out.json") as f:
-        compile_data = json.load(f)
-    rows_per_pe = int(compile_data['params']['rows_per_pe'])
+# ---------------------------------------------------------------------------
+# Launch kernel
+# ---------------------------------------------------------------------------
+print(f"[5/7] Launching kernel 'compute' ...")
+print(f"       Phase 1: Each PE computes squared-L2 distances + local top-{K}")
+print(f"         - Distance: DSD-vectorized @fsubs + @fmuls over {d_dim} dims")
+print(f"         - Top-K: {'shell sort (O(N^1.5))' if K >= rows_per_pe else f'binary search insertion (O(N·log {K}))'}")
+print(f"       Phase 2: Row-reduce (east→west), {P-1} merge steps, {2*K} wavelets/step")
+print(f"       Phase 3: Col-reduce (south→north), {P-1} merge steps on col 0")
+print(f"       Phase 4: PE(0,0) writes result_indices + result_distances")
 
-    # -------------------------------------------------------------------------
-    # 2. Set up the runtime: connects to simulator (or real wafer if cmaddr set)
-    #    cmaddr=None  → uses the local fabric simulator (Apptainer container)
-    #    cmaddr=ip:port → connects to a real Cerebras CS-2 over the network
-    # -------------------------------------------------------------------------
-    runner = SdkRuntime(args.name, cmaddr=args.cmaddr)
+t0 = time.time()
+runner.launch("main", nonblock=False)
+t1 = time.time()
+print(f"       Kernel finished in {t1-t0:.2f}s (simulator wall time)")
 
-    # Get host-side handles for the symbols pe.csl exported.
-    # These names must match @export_symbol(..., "name") on the device side.
-    sym_D           = runner.get_id("D_shard")
-    sym_q           = runner.get_id("q")
-    sym_final_dists = runner.get_id("final_dists")
-    sym_final_idxs  = runner.get_id("final_idxs")
-    sym_perf_log    = runner.get_id("perf_log")
+# ---------------------------------------------------------------------------
+# D2H: read results from PE(0,0)
+# ---------------------------------------------------------------------------
+print(f"[6/7] D2H: reading {K} indices + {K} distances from PE(0,0) ...")
+result_indices_u32 = np.zeros(K, dtype=np.uint32)
+result_distances = np.zeros(K, dtype=np.float32)
 
-    runner.load()    # Push the compiled ELF binaries to all 16 PEs
-    runner.run()     # Start the runtime; each PE waits for tasks to fire
+runner.memcpy_d2h(
+    result_indices_u32,
+    idx_sym,
+    0, 0, 1, 1,
+    K,
+    streaming=False,
+    order=MemcpyOrder.ROW_MAJOR,
+    data_type=MemcpyDataType.MEMCPY_32BIT,
+    nonblock=False,
+)
+runner.memcpy_d2h(
+    result_distances,
+    dist_sym,
+    0, 0, 1, 1,
+    K,
+    streaming=False,
+    order=MemcpyOrder.ROW_MAJOR,
+    data_type=MemcpyDataType.MEMCPY_32BIT,
+    nonblock=False,
+)
 
-    # -------------------------------------------------------------------------
-    # 3. Send D shards. memcpy_h2d arguments:
-    #      sym, host_array, start_col, start_row, width, height, elements_per_pe,
-    #      streaming=False, order, data_type, nonblock
-    # `nonblock=False` makes Python wait until the device has received the data.
-    # -------------------------------------------------------------------------
-    D_flat = shard_D_for_pes(D, P, rows_per_pe, d_dim)
-    runner.memcpy_h2d(
-        sym_D, D_flat,
-        0, 0, P, P,                 # ROI: from (col=0, row=0), spans P×P
-        rows_per_pe * d_dim,         # elements per PE
-        streaming=False,
-        order=MemcpyOrder.ROW_MAJOR,
-        data_type=MemcpyDataType.MEMCPY_32BIT,
-        nonblock=False,
-    )
+runner.stop()
 
-    # -------------------------------------------------------------------------
-    # 4. Send q replicated to ALL PEs.
-    #    np.tile(q, P*P) makes a flat array [q, q, q, ...] of length P*P*d_dim,
-    #    which ROW_MAJOR memcpy delivers as the same q to each PE.
-    # -------------------------------------------------------------------------
-    q_replicated = np.tile(q, P * P).astype(np.float32)
-    runner.memcpy_h2d(
-        sym_q, q_replicated,
-        0, 0, P, P,
-        d_dim,
-        streaming=False,
-        order=MemcpyOrder.ROW_MAJOR,
-        data_type=MemcpyDataType.MEMCPY_32BIT,
-        nonblock=False,
-    )
+# Cast u32 → i32 for comparison with oracle
+result_indices = result_indices_u32.astype(np.int32)
 
-    # -------------------------------------------------------------------------
-    # 5. Launch the kernel. This blocks until the device's main() finishes.
-    #    "Finish" = device calls sys_mod.unblock_cmd_stream() in the EXIT task.
-    #    If pe.csl forgets that call, this line hangs forever.
-    # -------------------------------------------------------------------------
-    runner.launch("main", nonblock=False)
+# Read cycle count from sim_stats.json if available
+cycles = "N/A"
+try:
+    with open("sim_stats.json") as f:
+        sim_stats = json.load(f)
+    cycles = sim_stats.get("cycle_count", "N/A")
+except Exception:
+    pass
+print(f"       Simulator cycles: {cycles}")
 
-    # -------------------------------------------------------------------------
-    # 6. Read back the final K results from PE(0,0) only.
-    #    ROI is 1×1 starting at (col=0, row=0).
-    # -------------------------------------------------------------------------
-    final_dists = np.zeros(K, dtype=np.float32)
-    final_idxs = np.zeros(K, dtype=np.uint32)
+# ---------------------------------------------------------------------------
+# Validate against oracle
+# ---------------------------------------------------------------------------
+print(f"[7/7] Validating against NumPy oracle ...")
+expected_idx, expected_dist = topk_reference(D, q, K, squared=True)
 
-    runner.memcpy_d2h(
-        final_dists, sym_final_dists,
-        0, 0, 1, 1,                  # ROI: only PE(0,0)
-        K,                           # K elements
-        streaming=False,
-        order=MemcpyOrder.ROW_MAJOR,
-        data_type=MemcpyDataType.MEMCPY_32BIT,
-        nonblock=False,
-    )
-    runner.memcpy_d2h(
-        final_idxs, sym_final_idxs,
-        0, 0, 1, 1, K,
-        streaming=False,
-        order=MemcpyOrder.ROW_MAJOR,
-        data_type=MemcpyDataType.MEMCPY_32BIT,
-        nonblock=False,
-    )
+# Show top results
+show_n = min(10, K)
+print(f"       Top-{show_n} results:")
+print(f"       {'Rank':<6} {'Got Idx':<10} {'Exp Idx':<10} {'Match':<7} {'Got Dist':<16} {'Exp Dist':<16} {'Diff':<12}")
+print(f"       {'----':<6} {'-------':<10} {'-------':<10} {'-----':<7} {'--------':<16} {'--------':<16} {'----':<12}")
+all_idx_match = True
+all_dist_close = True
+for i in range(show_n):
+    got_i = result_indices[i]
+    exp_i = expected_idx[i]
+    got_d = result_distances[i]
+    exp_d = expected_dist[i]
+    idx_ok = "✓" if got_i == exp_i else "✗"
+    dist_diff = abs(got_d - exp_d)
+    dist_ok = dist_diff <= 1e-3
+    if got_i != exp_i:
+        all_idx_match = False
+    if not dist_ok:
+        all_dist_close = False
+    print(f"       {i:<6} {got_i:<10} {exp_i:<10} {idx_ok:<7} {got_d:<16.8f} {exp_d:<16.8f} {dist_diff:<12.2e}")
 
-    # Read perf_log from ALL PEs: 6 timestamps × P*P PEs.
-    # Use flat 1-D buffer; reshape after to (P, P, 6) — col-major over PEs.
-    perf_flat = np.zeros(P * P * 6, dtype=np.uint32)
-    runner.memcpy_d2h(
-        perf_flat, sym_perf_log,
-        0, 0, P, P, 6,
-        streaming=False,
-        order=MemcpyOrder.ROW_MAJOR,
-        data_type=MemcpyDataType.MEMCPY_32BIT,
-        nonblock=False,
-    )
-    perf_all = perf_flat.reshape(P, P, 6)
+if K > show_n:
+    # Check remaining silently
+    remaining_idx_ok = np.array_equal(result_indices[show_n:], expected_idx[show_n:])
+    remaining_dist_ok = np.allclose(result_distances[show_n:], expected_dist[show_n:], atol=1e-3, rtol=0)
+    print(f"       ... ({K - show_n} more entries: idx={'✓' if remaining_idx_ok else '✗'}, dist={'✓' if remaining_dist_ok else '✗'})")
+    if not remaining_idx_ok:
+        all_idx_match = False
+    if not remaining_dist_ok:
+        all_dist_close = False
 
-    runner.stop()    # Disconnect from the device
+print()
+try:
+    np.testing.assert_array_equal(result_indices, expected_idx)
+    np.testing.assert_allclose(result_distances, expected_dist, atol=1e-3, rtol=0)
+except Exception as e:
+    print(f"FAIL: {args.case}")
+    print(str(e))
+    sys.exit(1)
 
-    # Dump perf_log to a sidecar JSON for the harness to pick up.
-    # Phase deltas per PE (TSC handles wraparound via uint32 subtraction).
-    import json as _json
-    perf_phases = ["compute", "pack", "x_gather", "y_gather", "merge"]
-    perf_data = {
-        "case": args.case,
-        "P": int(P), "K": int(K), "d_dim": int(d_dim), "rows_per_pe": int(rows_per_pe),
-        "per_pe": []
-    }
-    for col in range(P):
-        for row in range(P):
-            ts = perf_all[col, row]
-            # Use uint32 subtraction (handles wraparound). Convert to int for safe diffs.
-            deltas = [int(np.uint32(ts[i+1]) - np.uint32(ts[i])) for i in range(5)]
-            perf_data["per_pe"].append({
-                "col": col, "row": row,
-                "raw_ts": [int(t) for t in ts],
-                "deltas": dict(zip(perf_phases, deltas)),
-                "total_compute_to_merge": int(np.uint32(ts[5]) - np.uint32(ts[0])),
-            })
-    with open(f"perf_{args.case}.json", "w") as f:
-        _json.dump(perf_data, f, indent=2)
-
-    # -------------------------------------------------------------------------
-    # 7. Verify against the NumPy oracle (reference.py).
-    # -------------------------------------------------------------------------
-    expected_idxs, expected_dists = topk_reference(D, q, K)
-
-    # Cast u32 → i32 to compare apples-to-apples with the oracle's int32 idxs
-    final_idxs_i32 = final_idxs.astype(np.int32)
-
-    if not np.array_equal(final_idxs_i32, expected_idxs):
-        print(f"FAIL idxs:")
-        print(f"  got:      {final_idxs_i32[:10]}")
-        print(f"  expected: {expected_idxs[:10]}")
-        sys.exit(1)
-
-    # Allow small fp32 tolerance on distances (1e-2 absolute, 1e-3 relative)
-    if not np.allclose(final_dists, expected_dists, atol=1e-2, rtol=1e-3):
-        print(f"FAIL dists:")
-        print(f"  got:      {final_dists[:5]}")
-        print(f"  expected: {expected_dists[:5]}")
-        sys.exit(1)
-
-    # -------------------------------------------------------------------------
-    # 8. Success — the grader greps stdout for "PASS: <case>"
-    # -------------------------------------------------------------------------
-    print(f"Got top-{K} indices match NumPy oracle for case '{args.case}'")
-    print(f"PASS: {args.case}")
-
-
-if __name__ == "__main__":
-    main()
+print(f"PASS: {args.case}")

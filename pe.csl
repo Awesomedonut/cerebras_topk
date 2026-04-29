@@ -74,7 +74,6 @@ const ns_recv_iq : input_queue  = @get_input_queue(3);
 // -----------------------------------------------------------------------------
 const sys_mod    = @import_module("<memcpy/memcpy>", memcpy_params);
 const layout_mod = @import_module("<layout>");
-const timestamp  = @import_module("<time>");
 
 
 // -----------------------------------------------------------------------------
@@ -110,19 +109,6 @@ var diff_buf : [d_dim]f32;
 
 const SENTINEL_DIST : f32 = 3.4e+38;
 const SENTINEL_IDX  : u32 = 0xFFFFFFFF;
-
-
-// -----------------------------------------------------------------------------
-// PERF INSTRUMENTATION
-// -----------------------------------------------------------------------------
-var tsc_scratch : [timestamp.tsc_size_words]u16;
-var perf_log : [6]u32;
-const ptr_perf_log : [*]u32 = &perf_log;
-
-fn record_perf(idx: u16) void {
-  timestamp.get_timestamp(&tsc_scratch);
-  perf_log[idx] = (@as(u32, tsc_scratch[1]) << @as(u16, 16)) | @as(u32, tsc_scratch[0]);
-}
 
 
 // -----------------------------------------------------------------------------
@@ -360,12 +346,11 @@ fn merge_received() void {
 // -----------------------------------------------------------------------------
 
 fn main() void {
-  timestamp.enable_tsc();
   @activate(compute_task_id);
 }
 
 task compute() void {
-  record_perf(0);
+
 
   const px : u16 = layout_mod.get_x_coord();
   const py : u16 = layout_mod.get_y_coord();
@@ -413,10 +398,8 @@ task compute() void {
   } else if (USE_HEAP) {
     heap_sort_asc();
   }
-  record_perf(1);
 
   pack_local_topk();
-  record_perf(2);
 
   if (is_ew_recver) {
     // Wait for EW data from east. Will trigger ew_recv_done.
@@ -434,7 +417,6 @@ task compute() void {
 }
 
 task ew_recv_done() void {
-  record_perf(3);
   merge_received();
 
   if (is_ew_sender) {
@@ -458,7 +440,6 @@ task ew_recv_done() void {
 }
 
 task ns_recv_done() void {
-  record_perf(4);
   merge_received();
 
   if (is_ns_sender) {
@@ -467,7 +448,6 @@ task ns_recv_done() void {
     @fmovs(ns_send_fdsd, send_buf_dsd, .{ .async = true, .activate = EXIT });
   } else {
     // PE(0,0): the final merge is done. Exit.
-    record_perf(5);
     @activate(EXIT);
   }
 }
@@ -498,6 +478,5 @@ comptime {
   @export_symbol(ptr_q,            "q");
   @export_symbol(ptr_local_dists,  "final_dists");
   @export_symbol(ptr_local_idxs,   "final_idxs");
-  @export_symbol(ptr_perf_log,     "perf_log");
   @export_symbol(main);
 }

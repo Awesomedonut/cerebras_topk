@@ -147,6 +147,5 @@ layout {
   @export_name("q",           [*]f32, true);
   @export_name("final_dists", [*]f32, false);
   @export_name("final_idxs",  [*]u32, false);
-  @export_name("perf_log",    [*]u32, false);
   @export_name("main",        fn()void);
 }

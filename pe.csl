@@ -378,23 +378,21 @@ task compute() void {
     var zr : u16 = 0;
     while (zr < rows_per_pe) : (zr += 1) { dist_buf[zr] = 0.0; }
 
-    // Base strided column DSD: D_shard[0], D_shard[d_dim], D_shard[2*d_dim], ...
-    // We rebuild from base each iteration to avoid strided-DSD-with-increment issues
-    // that cause simulator faults on some platforms.
-    const base_col_dsd = @get_dsd(mem1d_dsd, .{
+    // Strided column DSD: D_shard[0], D_shard[d_dim], D_shard[2*d_dim], ...
+    var col_dsd = @get_dsd(mem1d_dsd, .{
       .tensor_access = |i|{rows_per_pe} -> D_shard[i * @as(i16, d_dim)]
     });
 
     var j : u16 = 0;
     while (j < d_dim) : (j += 1) {
-      // Rebuild col_dsd from base + offset j (avoids chained increment on strided DSD)
-      const col_dsd = @increment_dsd_offset(base_col_dsd, @as(i16, j), f32);
       // tmp[row] = D_shard[row*d_dim + j] - q[j]  (scalar broadcast)
       @fsubs(tmp_buf_dsd, col_dsd, q[j]);
       // tmp[row] = tmp[row]^2
       @fmuls(tmp_buf_dsd, tmp_buf_dsd, tmp_buf_dsd);
-      // dist[row] += tmp[row]  (use tmp as src, dist as separate dst to avoid aliasing)
+      // dist[row] += tmp[row]
       @fadds(dist_buf_dsd, dist_buf_dsd, tmp_buf_dsd);
+      // Advance to next column
+      col_dsd = @increment_dsd_offset(col_dsd, 1, f32);
     }
 
     // Now dist_buf[row] has squared L2 for each row. Feed into top-K.

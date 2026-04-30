@@ -1,37 +1,11 @@
 // =============================================================================
-// pe.csl — Per-PE program for Top-K k-NN with chain-reduction merge
+// pe.csl — Per-PE kernel for Top-K k-NN chain-reduction merge
+// Phases: distance → local top-K → EW chain → NS chain → unblock
+// Task chain: compute → ew_recv_done → ns_recv_done → EXIT
 // =============================================================================
-//
-// PHASES (per PE):
-//   1. compute squared L2 distance for own rows; maintain local top-K
-//   2. pack local top-K as [2*K]u32 (interleaved dist_bits, idx)
-//   3. EW chain reduction (E→W): merge across each row
-//   4. NS chain reduction (S→N): merge col 0 → PE(0,0)
-//   5. unblock cmd_stream (every PE) so host can read results
-//
-// PE ROLES (set at compile time by layout.csl):
-//   is_ew_recver: this PE receives an EW wavelet from its east neighbor
-//   is_ew_sender: this PE sends an EW wavelet to its west neighbor
-//   is_col_0:     this PE is in column 0 (participates in NS phase)
-//   is_ns_recver: col-0 PE receives NS wavelet from its south neighbor
-//   is_ns_sender: col-0 PE sends NS wavelet to its north neighbor
-//
-// TASK CHAIN (per PE):
-//   compute → (rightmost? send EW → EXIT; else recv EW → ew_recv_done)
-//   ew_recv_done → merge own + recv;
-//                  if middle EW: pack & send EW → EXIT
-//                  if leftmost (col 0): start NS phase
-//                    if NS recver: recv NS → ns_recv_done
-//                    elif NS sender (only PE(0,P-1)): pack & send NS → EXIT
-//                    else (P=1): EXIT
-//   ns_recv_done → merge own + recv;
-//                  if NS sender (middle col 0): pack & send NS → EXIT
-//                  else (PE(0,0)): EXIT (final result in local_dists/idxs)
-// =============================================================================
-
 
 // -----------------------------------------------------------------------------
-// PARAMETERS (filled by layout.csl @set_tile_code)
+// Parameters (from layout.csl)
 // -----------------------------------------------------------------------------
 param memcpy_params;
 param P : u16;
@@ -51,7 +25,7 @@ param is_ns_recver : bool;
 
 
 // -----------------------------------------------------------------------------
-// TASK IDS
+// Task IDs
 // -----------------------------------------------------------------------------
 const compute_task_id : local_task_id = @get_local_task_id(12);
 const ew_recv_done_id : local_task_id = @get_local_task_id(8);
@@ -60,7 +34,7 @@ const EXIT            : local_task_id = @get_local_task_id(9);
 
 
 // -----------------------------------------------------------------------------
-// QUEUES — single send/recv pair for each direction
+// Queues
 // -----------------------------------------------------------------------------
 const ew_send_oq : output_queue = @get_output_queue(2);
 const ew_recv_iq : input_queue  = @get_input_queue(2);
@@ -69,7 +43,7 @@ const ns_recv_iq : input_queue  = @get_input_queue(3);
 
 
 // -----------------------------------------------------------------------------
-// MODULE IMPORTS
+// Imports
 // -----------------------------------------------------------------------------
 const sys_mod    = @import_module("<memcpy/memcpy>", memcpy_params);
 const layout_mod = @import_module("<layout>");
@@ -116,20 +90,17 @@ const SENTINEL_IDX  : u32 = 0xFFFFFFFF;
 
 
 // -----------------------------------------------------------------------------
-// DSDs — for compute and for fabric I/O
+// DSDs
 // -----------------------------------------------------------------------------
 const q_dsd    = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{d_dim} -> q[i] });
 const diff_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{d_dim} -> diff_buf[i] });
 
-// Column-wise DSDs: process all rows_per_pe rows at once per column
 const dist_buf_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{rows_per_pe} -> dist_buf[i] });
 const tmp_buf_dsd  = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{rows_per_pe} -> tmp_buf[i] });
 
 const send_buf_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * K} -> send_buf[i] });
 const recv_buf_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * K} -> recv_buf[i] });
 
-// Fabric DSDs — these specify color + queue at compile time.
-// We only declare the ones this PE actually uses (via the comptime if pattern).
 const ew_send_fdsd = @get_dsd(fabout_dsd, .{
     .fabric_color = ew_send_color, .extent = 2 * K, .output_queue = ew_send_oq
 });
@@ -145,7 +116,7 @@ const ns_recv_fdsd = @get_dsd(fabin_dsd, .{
 
 
 // -----------------------------------------------------------------------------
-// HELPERS
+// Helpers
 // -----------------------------------------------------------------------------
 
 fn lex_less(d1: f32, idx1: u32, d2: f32, idx2: u32) bool {
@@ -162,9 +133,7 @@ fn init_topk() void {
   }
 }
 
-// Max-heap on local_dists/local_idxs (heap[0] = worst of current top-K).
-// Sift-down restores heap property starting at start_idx, considering only
-// elements in [0, heap_size). Used both for replace-root and for heap-sort.
+// Max-heap sift-down (heap[0] = worst). Used by replace-root and heap-sort.
 fn sift_down(start_idx: u16, heap_size: u16) void {
   var idx : u16 = start_idx;
   while (true) {
@@ -198,12 +167,10 @@ fn sift_down(start_idx: u16, heap_size: u16) void {
 // at small K. Heap wins big at K=256; insertion wins at K<=16.
 const USE_HEAP : bool = K >= 32;
 
-// Special case: when K == rows_per_pe, every row qualifies for the local top-K.
-// Skip insertion logic entirely — direct write + single sort at end.
-// Currently triggers for k_large (P=2, K=256, rows_per_pe=256).
+// K == rows_per_pe: skip insertion, write all then sort. Triggers for k_large.
 const SORT_ALL : bool = K == rows_per_pe;
 
-// Insertion sort: O(K) per insert with early-exit. Wins at small K.
+// Insertion sort with early-exit. Used when K < 32.
 fn insert_sort_topk(new_dist: f32, new_idx: u32) void {
   if (!lex_less(new_dist, new_idx, local_dists[K-1], local_idxs[K-1])) return;
   var i : u16 = K - 1;
@@ -217,7 +184,7 @@ fn insert_sort_topk(new_dist: f32, new_idx: u32) void {
   local_idxs[i]  = new_idx;
 }
 
-// Heap replace-root: O(log K) sift. Wins at large K.
+// Heap replace-root. Used when K >= 32.
 fn heap_replace_topk(new_dist: f32, new_idx: u32) void {
   if (!lex_less(new_dist, new_idx, local_dists[0], local_idxs[0])) return;
   local_dists[0] = new_dist;
@@ -225,7 +192,7 @@ fn heap_replace_topk(new_dist: f32, new_idx: u32) void {
   sift_down(0, K);
 }
 
-// Dispatch (compile-time): the compiler picks one branch and discards the other.
+// Comptime dispatch: compiler dead-code-eliminates the unused branch.
 fn insert_topk(new_dist: f32, new_idx: u32) void {
   if (USE_HEAP) {
     heap_replace_topk(new_dist, new_idx);
@@ -234,8 +201,7 @@ fn insert_topk(new_dist: f32, new_idx: u32) void {
   }
 }
 
-// Floyd's bottom-up heapify: builds a max-heap from arbitrary array contents
-// in O(K). Used by SORT_ALL path which writes raw values then sorts.
+// Bottom-up heapify in O(K). Used by SORT_ALL path.
 fn heapify() void {
   if (K < 2) return;
   // Start from last non-leaf node (= K/2 - 1) and sift_down down to root.
@@ -246,14 +212,11 @@ fn heapify() void {
   }
 }
 
-// Heap-sort the K elements into ASCENDING order in-place.
-// Required because chain-merge expects sorted-ascending input from each PE.
+// Heap-sort to ascending (chain-merge expects sorted input).
 fn heap_sort_asc() void {
   var n : u16 = K;
   while (n > 1) {
     n -= 1;
-    // Swap root (current max) into position n, then sift the new root down
-    // through the reduced heap [0, n).
     const td : f32 = local_dists[0];
     const ti : u32 = local_idxs[0];
     local_dists[0] = local_dists[n];
@@ -274,8 +237,7 @@ fn reduce_diff_sqr(d_val: f32, q_val: f32, sum: *f32) f32 {
   return sum.* + diff * diff;
 }
 
-// Row-wise fallback paths (not exercised when USE_COLWISE_DIST=true; retained for reference).
-// Explicit-DSD path: 2 vector ops + scalar reduction. Wins at small d_dim.
+// Row-wise fallback (not exercised; USE_COLWISE_DIST=true).
 fn compute_row_dist_dsd(row_dsd: mem1d_dsd) f32 {
   @fsubs(diff_dsd, row_dsd, q_dsd);
   @fmuls(diff_dsd, diff_dsd, diff_dsd);
@@ -287,14 +249,12 @@ fn compute_row_dist_dsd(row_dsd: mem1d_dsd) f32 {
   return sum;
 }
 
-// @map-fused path: one pass, no intermediate buffer. Wins at large d_dim.
 fn compute_row_dist_map(row_dsd: mem1d_dsd) f32 {
   var sum : f32 = 0.0;
   @map(reduce_diff_sqr, row_dsd, q_dsd, &sum, &sum);
   return sum;
 }
 
-// Compile-time dispatch: compiler dead-code-eliminates the unused path.
 fn compute_row_dist(row_dsd: mem1d_dsd) f32 {
   if (USE_MAP_DISTANCE) {
     return compute_row_dist_map(row_dsd);
@@ -311,8 +271,7 @@ fn pack_local_topk() void {
   }
 }
 
-// Two-pointer merge: local_dists/idxs (sorted ascending) + recv_buf (sorted ascending)
-// → top K (sorted ascending), written back into local_dists/idxs.
+// Two-pointer merge of local + recv → top K, written back to local.
 fn merge_received() void {
   var i   : u16 = 0;  // index into local
   var j   : u16 = 0;  // index into recv_buf
@@ -349,7 +308,7 @@ fn merge_received() void {
 
 
 // -----------------------------------------------------------------------------
-// TASK CHAIN
+// Task chain
 // -----------------------------------------------------------------------------
 
 fn main() void {
@@ -502,7 +461,7 @@ task f_exit() void {
 
 
 // -----------------------------------------------------------------------------
-// COMPTIME — task bindings, queue setup, exports
+// Comptime
 // -----------------------------------------------------------------------------
 comptime {
   @bind_local_task(compute,        compute_task_id);
@@ -510,7 +469,6 @@ comptime {
   @bind_local_task(ns_recv_done,   ns_recv_done_id);
   @bind_local_task(f_exit,         EXIT);
 
-  // Initialize input queues with their colors (only for queues we actually use).
   if (is_ew_recver) {
     @initialize_queue(ew_recv_iq, .{ .color = ew_recv_color });
   }

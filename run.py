@@ -14,18 +14,18 @@ import time
 import numpy as np
 from pathlib import Path
 
-# Search for reference.py: same dir, parent dir, or challenge root
+# Search for reference.py: alongside run.py (our case), or one dir up (grader layout)
 _here = Path(__file__).resolve().parent
-for _candidate in [_here, _here.parent, _here.parent / "cerebras-kernel-challenge"]:
+for _candidate in [_here, _here.parent]:
     if (_candidate / "reference.py").exists():
         sys.path.insert(0, str(_candidate))
         break
 
 from reference import topk_reference, ALL_CASES  # noqa: E402
 
-from cerebras.sdk.runtime.sdkruntimepybind import SdkRuntime      # noqa: E402
-from cerebras.sdk.runtime.sdkruntimepybind import MemcpyDataType   # noqa: E402
-from cerebras.sdk.runtime.sdkruntimepybind import MemcpyOrder      # noqa: E402
+from cerebras.sdk.runtime.sdkruntimepybind import (  # noqa: E402
+    SdkRuntime, MemcpyDataType, MemcpyOrder,
+)
 
 # ---------------------------------------------------------------------------
 # CLI

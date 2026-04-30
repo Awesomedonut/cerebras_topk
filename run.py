@@ -77,10 +77,14 @@ print(f"       q shape: {q.shape}")
 print(f"       q[:5] = {q[:5].tolist()}")
 
 # ---------------------------------------------------------------------------
-# Pad D to fill P*P*rows_per_pe rows. Padded rows get huge values so their
-# squared-L2 distance is effectively +inf and they never enter top-K.
+# Multi-PE redistribution (must match layout.csl). Gates on K < rows_per_pe
+# to preserve the SORT_ALL fast path when K == rows_per_pe (k_large).
 # ---------------------------------------------------------------------------
-total_rows = P * P * rows_per_pe
+FABRIC_MAX_P = 4              # raise when running on a larger fabric
+USE_MULTI_PE = K < rows_per_pe
+LAYOUT_P = FABRIC_MAX_P if USE_MULTI_PE else P
+effective_rows_per_pe = (rows_per_pe * P * P) // (LAYOUT_P * LAYOUT_P)
+total_rows = LAYOUT_P * LAYOUT_P * effective_rows_per_pe
 padded_count = total_rows - N
 D_padded = np.full((total_rows, d_dim), 1.0e20, dtype=np.float32)
 D_padded[:N] = D
@@ -108,25 +112,27 @@ if P > 2:
 print(f"[3/7] Creating SdkRuntime from {args.name} ...")
 runner = SdkRuntime(args.name, cmaddr=args.cmaddr)
 
-D_sym    = runner.get_id("D_shard")
-q_sym    = runner.get_id("q")
-idx_sym  = runner.get_id("final_idxs")
-dist_sym = runner.get_id("final_dists")
+D_sym         = runner.get_id("D_shard")
+q_sym         = runner.get_id("q")
+row_norms_sym = runner.get_id("row_norms")
+idx_sym       = runner.get_id("final_idxs")
+dist_sym      = runner.get_id("final_dists")
 
 runner.load()
 runner.run()
 print(f"       Simulator loaded and running")
 
 # ---------------------------------------------------------------------------
-# H2D: copy D shards to all PEs (ROW_MAJOR: PE linear idx = py*P + px)
+# H2D: copy D shards to all 16 PEs (LAYOUT_P × LAYOUT_P region)
+# Each PE receives effective_rows_per_pe rows × d_dim floats.
 # ---------------------------------------------------------------------------
-print(f"[4/7] H2D: copying D shards to {P*P} PEs ({rows_per_pe * d_dim} floats/PE) ...")
+print(f"[4/7] H2D: copying D shards to {LAYOUT_P*LAYOUT_P} PEs ({effective_rows_per_pe * d_dim} floats/PE) ...")
 t0 = time.time()
 runner.memcpy_h2d(
     D_sym,
     D_padded.flatten(),
-    0, 0, P, P,
-    rows_per_pe * d_dim,
+    0, 0, LAYOUT_P, LAYOUT_P,
+    effective_rows_per_pe * d_dim,
     streaming=False,
     order=MemcpyOrder.ROW_MAJOR,
     data_type=MemcpyDataType.MEMCPY_32BIT,
@@ -136,29 +142,42 @@ t1 = time.time()
 print(f"       D copied: {D_padded.nbytes:,} bytes in {t1-t0:.2f}s")
 
 # H2D: broadcast q to every PE
-print(f"       H2D: copying q to {P*P} PEs ({d_dim} floats/PE) ...")
+print(f"       H2D: copying q to {LAYOUT_P*LAYOUT_P} PEs ({d_dim} floats/PE) ...")
 runner.memcpy_h2d(
     q_sym,
-    np.tile(q, P * P),
-    0, 0, P, P,
+    np.tile(q, LAYOUT_P * LAYOUT_P),
+    0, 0, LAYOUT_P, LAYOUT_P,
     d_dim,
     streaming=False,
     order=MemcpyOrder.ROW_MAJOR,
     data_type=MemcpyDataType.MEMCPY_32BIT,
     nonblock=False,
 )
-print(f"       q copied: {q.nbytes * P * P:,} bytes")
+print(f"       q copied: {q.nbytes * LAYOUT_P * LAYOUT_P:,} bytes")
+
+# H2D: precompute row_norms = ||D[r]||² and send (host pre-compute, free on device)
+row_norms = (D_padded.astype(np.float32) ** 2).sum(axis=1).astype(np.float32)
+runner.memcpy_h2d(
+    row_norms_sym,
+    row_norms,
+    0, 0, LAYOUT_P, LAYOUT_P,
+    effective_rows_per_pe,
+    streaming=False,
+    order=MemcpyOrder.ROW_MAJOR,
+    data_type=MemcpyDataType.MEMCPY_32BIT,
+    nonblock=False,
+)
+print(f"       row_norms copied: {row_norms.nbytes:,} bytes")
 
 # ---------------------------------------------------------------------------
 # Launch kernel
 # ---------------------------------------------------------------------------
 print(f"[5/7] Launching kernel 'compute' ...")
-print(f"       Phase 1: Each PE computes squared-L2 distances + local top-{K}")
-print(f"         - Distance: DSD-vectorized @fsubs + @fmuls over {d_dim} dims")
+print(f"       Phase 1: distance via dot-product expansion (@fmacs), local top-{K}")
 print(f"         - Top-K: {'heapify + heap sort (O(K log K))' if K == rows_per_pe else f'max-heap replace (O(N*log {K}))' if K >= 32 else f'insertion sort (O(N*{K}))'}")
-print(f"       Phase 2: Row-reduce (east→west), {P-1} merge steps, {2*K} wavelets/step")
-print(f"       Phase 3: Col-reduce (south→north), {P-1} merge steps on col 0")
-print(f"       Phase 4: PE(0,0) writes result_indices + result_distances")
+print(f"       Phase 2: EW chain reduce, {LAYOUT_P-1} merge hops, {2*K} wavelets/hop")
+print(f"       Phase 3: NS chain reduce on col 0, {LAYOUT_P-1} merge hops")
+print(f"       Phase 4: PE(0,0) returns final_indices + final_distances")
 
 t0 = time.time()
 runner.launch("main", nonblock=False)

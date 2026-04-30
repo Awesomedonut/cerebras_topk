@@ -1,43 +1,52 @@
 # Top-K k-NN on the WSE-2 — Design Memo
 
-**Author:** Jin Song · **Distances:** squared L2 · **Final cycles:** 691,534
+**Author:** Jin Song · **Distances:** squared L2 · **Final cycles:** 691,532
 
-## 1. Routing Topology — Chain Reduction
+## 1. Routing topology
 
 ```
-EW (all rows parallel, colors 0/1 ping-pong):
-  row y:  PE(P-1,y) ─color_a→ PE(P-2,y) ─color_b→ … → PE(0,y)
+EW chain (all rows parallel, colors 0/1 ping-pong by Px parity):
+  row y:  PE(L-1, y) ─0→ PE(L-2, y) ─1→ PE(L-3, y) ─0→ ... → PE(0, y)
 
-NS (col 0 only, colors 4/5 ping-pong):
-  col 0:  PE(0,P-1) ─color_a→ PE(0,P-2) ─color_b→ … → PE(0,0)  ← result
+NS chain (col 0 only, colors 4/5 ping-pong by Py parity):
+  col 0:  PE(0, L-1) ─4→ PE(0, L-2) ─5→ ... → PE(0, 0)   ← result
 ```
 
-Four colors checkerboarded so each hop is point-to-point. Each hop carries **2K u32** — K `(dist_bits, idx)` pairs interleaved. Role flags are comptime booleans; compiler DCEs unused branches per case binary. Chain over tree: at P=4, chain = 3 hops vs tree's 2, but fabric is <1% of total — simpler routing outweighs the saved hop.
+Four colors, checkerboarded — every hop is point-to-point, no contention. Each hop carries `2·K` u32 wavelets: `K` interleaved `(dist_bits, idx)` pairs. `L = LAYOUT_P` is 4 when `K < rows_per_pe` (idle-PE redistribution), else host `P`. Endpoints configure only the color they actually use; intermediate PEs configure both.
 
-## 2. Per-PE Algorithm
+## 2. Local top-K
 
-**Distance — dot-product expansion.** `||D-q||² = ||D||² − 2·D·q + ||q||²`. Host pre-computes `||D[r]||²` (free on device). Per column j: `@fmacs(dist, dist, D_col_j, -2·q[j])` — one DSD call vs three. Drops DSD count from `3·d_dim` to `d_dim + 2`.
+**Distance — dot-product expansion.** `||D−q||² = ||D||² − 2·D·q + ||q||²`. Host pre-computes `||D[r]||²` once (free — D is fixed at memcpy). Per column j: one `@fmacs(dist, dist, D_col_j, −2·q[j])` with `q[j]` as scalar broadcast; final `dist += ||q||²`. Drops per-PE compute DSDs from `3·d_dim` to `d_dim + 2`.
 
-**Cycles per element:** dominant loop is @fmacs at ~1 cycle/element × rows_per_pe extent. Baseline: 32 cols × 128 rows ≈ 4K cycles, ~31 cycles/row.
+**Top-K — three comptime paths:**
 
-**Top-K — three comptime paths:** heap-sort for K==rows_per_pe (O(K log K)), max-heap for K≥32 (O(N·log K)), insertion sort for K<32 (worst O(N·K)). Compiler DCEs unused paths.
+| Condition | Algorithm | Cost / element |
+|---|---|---|
+| `K == rows_per_pe` (SORT_ALL) | Floyd heapify + heap_sort_asc | O(K log K), ~3 cyc heapify, ~6 cyc/sift |
+| `K ≥ 32` | Max-heap replace-root + sift_down | O(N · log K), ~7 cyc/elem |
+| `K < 32` | Insertion sort, early-exit on full | Worst O(N · K), ~4 cyc/elem |
 
-**Multi-PE redistribution (gated on `K < rows_per_pe`).** Expands to 4×4 grid to use idle PEs, reducing per-PE rows 4×. Skips on k_large to preserve SORT_ALL fast path.
+Heap was chosen because scalar bitonic (+267K), bottom-up mergesort (+122K), and LSD radix (+54K) all regressed. The CSL compiler optimizes heap-sift loops well; scalar alternatives carry overheads that exceed savings on this simulator.
 
-**SRAM (k_large worst):** D 16KB + buffers 12KB + dist+norms 2KB = **~28KB of 48KB**.
+## 3. Fabric bandwidth
 
-## 3. Fabric Bandwidth
+Worst case is `k_large`: K=256, LAYOUT_P=2 (gate skips multi-PE). Each EW hop carries `2·K = 512` u32 wavelets; one EW hop per row × 2 rows = 1024 wavelets EW total. NS chain: 1 hop × 512 wavelets. The single most-loaded edge sees **512 wavelets**.
 
-Any active edge carries exactly **2K wavelets**. Worst case (k_large, K=256): **512 wavelets per edge**. Whole-grid: EW = P×(P−1)×2K, NS = (P−1)×2K.
+Across all six cases `idle_ce_cycles ≈ 50` per case. Bottleneck is **sort + compute**, not routing — `heap_sort_asc` on K=256 alone is ~203K cycles (56% of k_large) while fabric is well under 1% of total.
 
-**Bottleneck is not fabric.** k_large: heap_sort_asc ~203K cycles (56%), fabric ~2K. Fabric <0.5% in all cases. The kernel is sort-bound on k_large, compute-bound elsewhere.
+## 4. Tie-breaking
 
-## 4. Tie-Breaking Proof
+Define `lex_less((d, idx), (d', idx')) := d < d' ∨ (d == d' ∧ idx < idx')`. Indices are globally unique (PE-linear offset + within-PE row), so lex_less is a strict total order. Each PE produces its local top-K under lex_less; `merge_received` selects K-smallest from the union of two sorted lists under the same order.
 
-`lex_less(d1, idx1, d2, idx2)` defines a strict total order (distance ascending, index ascending). Indices are globally unique. `merge_received()` selects K-smallest from two sorted lists under this order. K-min under a total order is associative + commutative — **output is uniquely determined regardless of reduction order or wavelet timing**. Determinism follows from the algebra, not fabric scheduling. Padded rows use `1.0e20` → +inf, always lex-loses.
+K-min under a total order is **associative and commutative**: for any A, B, C,
 
-## 5. What 2× More Time Would Buy
+  `topK(A ∪ B ∪ C) = topK(topK(A ∪ B) ∪ C) = topK(A ∪ topK(B ∪ C))`.
 
-1. **Microthread-parallel heap_sort on k_large.** k_large's heap_sort_asc is 203K cycles (56% of total). Sort two halves of K=256 concurrently on WSE-2's two microthreads, then merge. Estimated ~115K savings if the microthread API supports concurrent array access.
+Therefore the EW chain yields the same K-min set regardless of the order intermediate wavelets arrive at a PE; NS composes likewise. Padded rows carry distance `1.0e20` (squared L2 → +inf) and lex-lose to every real row. **Determinism follows from the algebra, not fabric scheduling** — verified bit-identical across 3 runs.
 
-2. **Vectorized bitonic sort via `@fmins`/`@fmaxs`.** Replace scalar heap_sort with a DSD-pipelined bitonic network. This is the only path to break below the scalar comparison floor on k_large. Initial attempt deadlocked the simulator; needs deeper SDK debugging to identify the constraint.
+## 5. With 2× more time
+
+1. **Microthread-parallel `heap_sort_asc` halves on k_large** — sort two halves of K=256 concurrently, then merge. Estimated **~115K savings (~17%)** if the WSE-2 microthread API permits the dependency pattern. ~25% probability of clean success.
+2. **Vectorized bitonic via `@fmins`/`@fmaxs`** — only path to attack k_large's heap_sort floor with hardware compare-swaps. First attempt deadlocked the simulator at K=256 (paired contiguous DSDs aliasing); needs deeper SDK debugging. If recovered, **~80–150K savings**.
+
+Both high-risk. Empirical evidence: once compute is optimized (fmacs + multi-PE-gated), further gains require attacking the sort itself, which scalar code cannot.

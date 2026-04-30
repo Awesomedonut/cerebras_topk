@@ -1,49 +1,58 @@
 # Top-K k-NN on the WSE-2 — Design Memo
 
-**Start:** Monday April 27th, 2026 · **Architecture:** chain-reduction merge · **Distances:** squared L2
+**Author:** Jin Song · **Start:** Monday April 27th, 2026 · **Distances:** squared L2
 
-## 1. Routing Topology
+## 1. Routing Topology — Chain Reduction
 
 ```
-  EW chain (all rows in parallel, colors 0/1 ping-pong):
+  EW (all rows parallel, colors 0/1 ping-pong):
   row y:  PE(P-1,y) ─color_a→ PE(P-2,y) ─color_b→ … → PE(0,y)
 
-  NS chain (column 0 only, colors 4/5 ping-pong):
+  NS (col 0 only, colors 4/5 ping-pong):
   col 0:  PE(0,P-1) ─color_a→ PE(0,P-2) ─color_b→ … → PE(0,0)  ← result
 ```
 
-Four colors, checkerboard: each PE receives on one color and sends on another. Each hop carries **2K u32 wavelets** — K `(dist_bits, idx)` pairs packed interleaved. Per-PE role flags (`is_ew_sender`, etc.) are comptime booleans; the compiler dead-code-eliminates unused branches.
+Four colors, checkerboard: each PE receives on one color and sends on another. Each hop carries **2K u32** — K `(dist_bits, idx)` pairs packed interleaved. Role flags (`is_ew_sender`, etc.) are comptime booleans from layout.csl; compiler dead-code-eliminates unused branches per case binary.
 
-## 2. Local Top-K Algorithm
+Chain over tree: for P=4, chain = 3 serial hops vs tree's 2, but fabric is <1% of total cycles. The simplicity of chain merge (one code path, no multi-level synchronization) outweighs the extra hop.
 
-**Distance — column-wise strided DSDs.** Instead of one row at a time (rows_per_pe × d_dim-extent DSD ops), I process one column at a time (d_dim × rows_per_pe-extent ops). A strided DSD walks column j; `@fsubs` broadcasts `q[j]`, `@fmuls` squares, `@fadds` accumulates into `dist_buf`. Fewer setups, larger extents, better pipeline utilization.
+## 2. Local Top-K — Adaptive Comptime Dispatch
 
-**Top-K selection — three comptime paths:**
+**Distance: column-wise strided DSDs.** d_dim iterations of rows_per_pe-extent ops instead of rows_per_pe iterations of d_dim-extent ops — fewer DSD setups, longer pipeline runs.
+
+**Top-K selection:**
 
 | Condition | Algorithm | Complexity |
 |---|---|---|
 | `K == rows_per_pe` | Floyd heapify + heap-sort | O(K log K) |
-| `K ≥ 32` | Max-heap replace-root + sift-down | O(rows_per_pe · log K) |
-| `K < 32` | Insertion sort, early-exit | Worst-case O(rows_per_pe · K) |
+| `K ≥ 32` | Max-heap replace-root + sift | O(N · log K) |
+| `K < 32` | Insertion sort, early-exit | Worst-case O(N · K) |
 
-Gated by `const SORT_ALL` / `const USE_HEAP` — compiler eliminates unused paths.
+**Memory budget (k_large, worst case):** D_shard 16KB + local/merge/send/recv 10KB + dist_buf+tmp_buf 2KB + diff 64B = **~28KB of 48KB.**
 
-**Cycles per element:** For baseline (128 rows, d=32), column-wise distance: 32 iters × 3 DSD ops × extent 128 ≈ 12K cycles, or **~3 cycles per D element**. Insertion sort adds ~2K. Total ≈ 14K per PE, ~109 cycles/row.
+## 3. Measured Cycles + Bandwidth
 
-## 3. Fabric Bandwidth
+| Case | P | K | d | rows/PE | Cycles | Fabric wavelets |
+|---|---|---|---|---|---|---|
+| baseline | 4 | 16 | 32 | 128 | 132,620 | 480 |
+| k_eq_1 | 2 | 1 | 32 | 256 | 91,106 | 4 |
+| k_large | 2 | 256 | 16 | 256 | 373,662 | 1,536 |
+| uneven | 4 | 16 | 32 | 64 | 81,366 | 480 |
+| all_equal | 2 | 16 | 16 | 256 | 73,447 | 64 |
+| duplicates | 2 | 8 | 16 | 256 | 68,585 | 32 |
 
-Any active edge carries exactly **2K wavelets**; unused edges carry zero. Whole-grid totals: EW = P rows × (P−1) hops × 2K; NS = (P−1) hops × 2K. Baseline (P=4, K=16): EW = 4×3×32 = 384, NS = 3×32 = 96, total **480 wavelets**. k_large (P=2, K=256): EW = 2×1×512 = 1024, NS = 1×512 = 512, total **1536 wavelets**.
+Fabric wavelets formula: EW = P × (P−1) × 2K; NS = (P−1) × 2K. Any active edge carries exactly 2K wavelets.
 
-**Bottleneck is compute.** Baseline measured 132K cycles; fabric is ~480 wavelets. k_large measured 373K cycles; fabric is ~1.5K wavelets. Fabric is never on the critical path.
+**Where cycles go (k_large breakdown estimate):** ~12K distance DSD ops + ~150K heap_sort_asc + ~48K DSD setup overhead (48 invocations × ~1K each) + ~30K fabric coordination + balance to memcpy/dispatch. The kernel is **sort-dominated at large K** and **DSD-setup-dominated at small K**. Fabric is never the bottleneck (<0.5% of cycles in all cases).
 
 ## 4. Tie-Breaking Proof
 
-`lex_less(d1, idx1, d2, idx2)` defines a strict total order (distance ascending, index ascending). Global indices are unique. `merge_received()` selects the K-smallest elements from the union of two sorted top-K lists under this total order. Since taking the K-smallest under a total order is both associative and commutative, **any reduction order yields the same result** — the output does not depend on wavelet arrival order. The fixed chain topology additionally guarantees deterministic execution timing, making the output bit-identical across runs.
+`lex_less(d1, idx1, d2, idx2)` defines a strict total order (distance ascending, index ascending). Global indices are unique. `merge_received()` selects the K-smallest from the union of two sorted lists under this order. Taking K-smallest under a total order is associative and commutative — **the output is uniquely determined regardless of reduction order or wavelet arrival timing.** The chain topology ensures deterministic execution, but correctness does not depend on it.
 
 Uneven padding: host fills invalid rows with `1.0e20`, whose squared distance overflows to +inf — always lex-loses.
 
-## 5. What 2× More Time Would Buy
+## 5. What Didn't Work + What 2× More Time Would Buy
 
-1. **Pipelined chain merge.** Overlap the rightmost PE's send with downstream PEs' compute. Hides one chain-hop latency behind computation — roughly **5–10%** on k_large.
+**Attempted and reverted:** K==1 scalar fast path (regressed k_eq_1 by +5K cycles — compiler optimizes K=1 loops better than manual scalar tracking). @map for all d_dim values (regressed d_dim=16 cases by 12% — per-element call overhead exceeds savings at small d).
 
-2. **Mixed-precision distances.** fp16 storage + fp32 accumulation halves DSD cycles, but fp16 error grows with magnitude. Squared L2 over random fp32 vectors can reach hundreds, so mixed precision needs per-case validation. Estimated **15–25%** on compute if precision holds.
+**With more time:** (1) Mixed-precision distances (fp16 storage + fp32 accumulation) — needs per-case tolerance validation, gains uncertain without measurement. (2) Overlap rightmost PE's chain send with downstream compute — ceiling is ~1K cycles (the chain's total fabric cost), so <1% on k_large.

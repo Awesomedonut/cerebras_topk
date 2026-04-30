@@ -223,8 +223,6 @@ fn heap_sort_asc() void {
   }
 }
 
-// Threshold: @map fuses diff+square+accumulate into one pass, winning at large d_dim.
-// At small d_dim the per-element call overhead exceeds the savings.
 fn pack_local_topk() void {
   var k : u16 = 0;
   while (k < K) : (k += 1) {

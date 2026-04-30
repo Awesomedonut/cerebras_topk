@@ -1,6 +1,6 @@
 # Top-K k-NN on the WSE-2 — Design Memo
 
-**Author:** Jin Song · **Start:** Mon Apr 27, 2026 · **Finish:** Wed Apr 30, 2026 · **Distances:** squared L2 · **Final cycles:** 691,532
+**Author:** Jin Song · **Start:** Mon Apr 27, 2026 · **Finish:** Wed Apr 29, 2026 · **Distances:** squared L2 · **Final cycles:** 691,532
 
 ## 1. Routing topology
 

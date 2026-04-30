@@ -107,7 +107,7 @@ var merge_idxs  : [K]u32;
 
 var diff_buf : [d_dim]f32;
 
-// Column-wise distance buffers (v8-colwise)
+// Column-wise distance buffers
 var dist_buf : [rows_per_pe]f32;  // accumulated squared distances per row
 var tmp_buf  : [rows_per_pe]f32;  // scratch for per-column diff²
 
@@ -195,8 +195,7 @@ fn sift_down(start_idx: u16, heap_size: u16) void {
 }
 
 // Threshold: heap maintenance + heap_sort_asc costs more than insertion sort
-// at small K. At K>=32 the heap's O(log K) per insert dominates and wins big.
-// Measured 2026-04-28: heap wins 8.5x at K=256, loses 1-15% at K<=16.
+// at small K. Heap wins big at K=256; insertion wins at K<=16.
 const USE_HEAP : bool = K >= 32;
 
 // Special case: when K == rows_per_pe, every row qualifies for the local top-K.
@@ -265,10 +264,8 @@ fn heap_sort_asc() void {
   }
 }
 
-// Threshold: @map fuses the per-element diff+square+accumulate into one pass,
-// winning at large d_dim by avoiding intermediate buffer writes. At small
-// d_dim the per-element call overhead exceeds the savings.
-// Measured 2026-04-28: d_dim=32 wins 1.25-1.76x; d_dim=16 loses 3-12%.
+// Threshold: @map fuses diff+square+accumulate into one pass, winning at large d_dim.
+// At small d_dim the per-element call overhead exceeds the savings.
 const USE_MAP_DISTANCE : bool = d_dim >= 32;
 const USE_COLWISE_DIST : bool = true;  // column-wise: d_dim iters of rows_per_pe-extent DSDs (amortizes setup)
 
@@ -368,7 +365,7 @@ task compute() void {
   const global_offset : u32 = pe_linear * @as(u32, rows_per_pe);
 
   if (USE_COLWISE_DIST) {
-    // ===== v8 COLUMN-WISE DISTANCE =====
+    // ===== COLUMN-WISE DISTANCE =====
     // Process one column at a time across ALL rows (strided DSD).
     // d_dim iterations of extent=rows_per_pe ops, instead of
     // rows_per_pe iterations of extent=d_dim ops.

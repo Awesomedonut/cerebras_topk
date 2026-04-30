@@ -43,11 +43,11 @@ Chain over tree: for P=4, chain = 3 serial hops vs tree's 2, but fabric is <1% o
 
 Fabric wavelets formula: EW = P × (P−1) × 2K; NS = (P−1) × 2K. Any active edge carries exactly 2K wavelets.
 
-**Where cycles go (k_large breakdown estimate):** ~12K distance DSD ops + ~150K heap_sort_asc + ~48K DSD setup overhead (48 invocations × ~1K each) + ~30K fabric coordination + balance to memcpy/dispatch. The kernel is **sort-dominated at large K** and **DSD-setup-dominated at small K**. Fabric is never the bottleneck (<0.5% of cycles in all cases).
+**Where cycles go (k_large estimate):** ~12K distance DSD ops, ~64K heap_sort_asc (255 sift-downs × ~250 cycles each), ~2K fabric — useful work ~78K of 373K measured (21%). The remaining ~295K is DSD setup overhead (48 invocations), async `@fmovs` round-trips, and simulator dispatch. The kernel is **setup-and-coordination-bound**, not compute-bound. Fabric is never the bottleneck (<0.5% of cycles).
 
 ## 4. Tie-Breaking Proof
 
-`lex_less(d1, idx1, d2, idx2)` defines a strict total order (distance ascending, index ascending). Global indices are unique. `merge_received()` selects the K-smallest from the union of two sorted lists under this order. Taking K-smallest under a total order is associative and commutative — **the output is uniquely determined regardless of reduction order or wavelet arrival timing.** The chain topology ensures deterministic execution, but correctness does not depend on it.
+`lex_less(d1, idx1, d2, idx2)` defines a strict total order (distance ascending, index ascending). Global indices are unique. `merge_received()` selects the K-smallest from the union of two sorted lists under this order. Taking K-smallest under a total order is associative and commutative — **the output is uniquely determined regardless of reduction order or wavelet arrival timing.** Correctness follows from the algebra, not from fabric timing.
 
 Uneven padding: host fills invalid rows with `1.0e20`, whose squared distance overflows to +inf — always lex-loses.
 

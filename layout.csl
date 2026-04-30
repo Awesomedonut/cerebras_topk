@@ -32,7 +32,9 @@ param d_dim : u16;
 param rows_per_pe : u16;
 param K : u16;
 
-// 4 colors for chain reduction
+// 4 colors for chain reduction.
+// IDs 0,1 for EW and 4,5 for NS — matches collectives_2d convention.
+// IDs 2,3 kept free; IDs 21-24, 27-31 reserved by memcpy.
 const ew_color_a : color = @get_color(0);
 const ew_color_b : color = @get_color(1);
 const ns_color_a : color = @get_color(4);
@@ -65,9 +67,8 @@ layout {
       // Role flags (compile-time constants per PE)
       const is_ew_sender : bool = Px > 0;          // can send west
       const is_ew_recver : bool = Px < P - 1;      // can receive from east
-      const is_col_0     : bool = Px == 0;
-      const is_ns_sender : bool = is_col_0 and (Py > 0);
-      const is_ns_recver : bool = is_col_0 and (Py < P - 1);
+      const is_ns_sender : bool = (Px == 0) and (Py > 0);
+      const is_ns_recver : bool = (Px == 0) and (Py < P - 1);
 
       @set_tile_code(Px, Py, "pe.csl", .{
         .memcpy_params = memcpy_params,
@@ -81,7 +82,6 @@ layout {
         .ns_recv_color = ns_recv_color,
         .is_ew_sender = is_ew_sender,
         .is_ew_recver = is_ew_recver,
-        .is_col_0 = is_col_0,
         .is_ns_sender = is_ns_sender,
         .is_ns_recver = is_ns_recver,
       });

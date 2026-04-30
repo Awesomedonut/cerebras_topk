@@ -52,7 +52,7 @@ print(f"       Case: {args.case}")
 print(f"       P={P}  d_dim={d_dim}  rows_per_pe={rows_per_pe}  K={K}")
 print(f"       PE grid: {P}x{P} = {P*P} PEs")
 print(f"       Total PE slots: {P*P*rows_per_pe} rows")
-print(f"       Sort path: {'HEAPIFY + HEAP SORT (K == rows_per_pe)' if K >= rows_per_pe else 'MAX-HEAP (K>=32)' if K >= 32 else 'INSERTION SORT (K<32)'}")
+print(f"       Sort path: {'HEAPIFY + HEAP SORT (K == rows_per_pe)' if K == rows_per_pe else 'MAX-HEAP (K>=32)' if K >= 32 else 'INSERTION SORT (K<32)'}")
 
 # ---------------------------------------------------------------------------
 # Generate test case (matches reference.py exactly)
@@ -155,7 +155,7 @@ print(f"       q copied: {q.nbytes * P * P:,} bytes")
 print(f"[5/7] Launching kernel 'compute' ...")
 print(f"       Phase 1: Each PE computes squared-L2 distances + local top-{K}")
 print(f"         - Distance: DSD-vectorized @fsubs + @fmuls over {d_dim} dims")
-print(f"         - Top-K: {'heapify + heap sort (O(K log K))' if K >= rows_per_pe else f'max-heap replace (O(N·log {K}))' if K >= 32 else f'insertion sort (O(N·{K}))'}")
+print(f"         - Top-K: {'heapify + heap sort (O(K log K))' if K == rows_per_pe else f'max-heap replace (O(N*log {K}))' if K >= 32 else f'insertion sort (O(N*{K}))'}")
 print(f"       Phase 2: Row-reduce (east→west), {P-1} merge steps, {2*K} wavelets/step")
 print(f"       Phase 3: Col-reduce (south→north), {P-1} merge steps on col 0")
 print(f"       Phase 4: PE(0,0) writes result_indices + result_distances")
@@ -226,7 +226,7 @@ for i in range(show_n):
     exp_i = expected_idx[i]
     got_d = result_distances[i]
     exp_d = expected_dist[i]
-    idx_ok = "✓" if got_i == exp_i else "✗"
+    idx_ok = "OK" if got_i == exp_i else "FAIL"
     dist_diff = abs(got_d - exp_d)
     dist_ok = dist_diff <= 1e-3
     if got_i != exp_i:
@@ -239,7 +239,7 @@ if K > show_n:
     # Check remaining silently
     remaining_idx_ok = np.array_equal(result_indices[show_n:], expected_idx[show_n:])
     remaining_dist_ok = np.allclose(result_distances[show_n:], expected_dist[show_n:], atol=1e-3, rtol=0)
-    print(f"       ... ({K - show_n} more entries: idx={'✓' if remaining_idx_ok else '✗'}, dist={'✓' if remaining_dist_ok else '✗'})")
+    print(f"       ... ({K - show_n} more entries: idx={'OK' if remaining_idx_ok else 'FAIL'}, dist={'OK' if remaining_dist_ok else 'FAIL'})")
     if not remaining_idx_ok:
         all_idx_match = False
     if not remaining_dist_ok:

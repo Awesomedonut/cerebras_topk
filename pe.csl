@@ -46,7 +46,6 @@ param ns_recv_color : color;
 
 param is_ew_sender : bool;
 param is_ew_recver : bool;
-param is_col_0     : bool;
 param is_ns_sender : bool;
 param is_ns_recver : bool;
 
@@ -85,8 +84,9 @@ const layout_mod = @import_module("<layout>");
 //   send/recv buf: 2*256*4*2  =  4,096 B
 //   merge_*: 256*4*2          =  2,048 B
 //   diff:    16*4             =     64 B
+//   dist_buf+tmp_buf: 256*4*2 =  2,048 B  (column-wise distance scratch)
 //   ─────────────────────────────────
-//   Total ~24 KB — well under 48 KB
+//   Total ~26 KB — well under 48 KB
 // -----------------------------------------------------------------------------
 var D_shard : [rows_per_pe * d_dim]f32;
 var ptr_D : [*]f32 = &D_shard;
@@ -270,13 +270,14 @@ fn heap_sort_asc() void {
 // d_dim the per-element call overhead exceeds the savings.
 // Measured 2026-04-28: d_dim=32 wins 1.25-1.76x; d_dim=16 loses 3-12%.
 const USE_MAP_DISTANCE : bool = d_dim >= 32;
-const USE_COLWISE_DIST : bool = true;  // v8: column-wise strided DSD distance
+const USE_COLWISE_DIST : bool = true;  // column-wise: d_dim iters of rows_per_pe-extent DSDs (amortizes setup)
 
 fn reduce_diff_sqr(d_val: f32, q_val: f32, sum: *f32) f32 {
   const diff : f32 = d_val - q_val;
   return sum.* + diff * diff;
 }
 
+// Row-wise fallback paths (not exercised when USE_COLWISE_DIST=true; retained for reference).
 // Explicit-DSD path: 2 vector ops + scalar reduction. Wins at small d_dim.
 fn compute_row_dist_dsd(row_dsd: mem1d_dsd) f32 {
   @fsubs(diff_dsd, row_dsd, q_dsd);
